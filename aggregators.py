@@ -1,18 +1,25 @@
-"""Aggregation rules for controlled FHHD-R experiments.
+"""Aggregation rules.
 
-FHHD-R is a proposed heuristic research variant, not a formal Hodge decomposition
-and not a certified Byzantine-robust algorithm. Scores are diagnostics, not proofs
-that a client is malicious. All methods return (aggregate, energy, client_weights).
-For coordinate-wise trimmed mean, per-client scalar weights are not well-defined,
-so client_weights is None.
+Baselines: FedAvg, Krum, TrimmedMean, Spatial Temporal, BOBA-inspired.
+Proposed : FHHD-Plus, FHHD-R, FHHD-R+.
+
+All rules return (aggregate, energy, client_weights); client_weights is None
+for coordinate-wise trimmed mean, where per-client scalars are undefined.
+These are research heuristics, not certified Byzantine-robust guarantees.
 """
+
 import torch
 
 
+# ----------------------------------------------------------------------
+# Baselines
+# ----------------------------------------------------------------------
 def fedavg(updates):
     G = torch.stack(updates)
-    weights = torch.full((len(updates),), 1.0 / len(updates), device=G.device, dtype=G.dtype)
-    return G.mean(0), float((weights * G.square().sum(1)).sum().detach().item()), weights
+    n = len(updates)
+    weights = torch.full((n,), 1.0 / n, device=G.device, dtype=G.dtype)
+    energy = float((weights * G.square().sum(1)).sum().detach().item())
+    return G.mean(0), energy, weights
 
 
 def krum(updates, f):
@@ -34,9 +41,29 @@ def trimmed_mean(updates, f):
     G = torch.stack(updates)
     n = G.shape[0]
     if f > 0 and n > 2 * f:
-        G = G.sort(dim=0).values[f:n-f]
+        G = G.sort(dim=0).values[f:n - f]
     aggregate = G.mean(0)
     return aggregate, float(aggregate.square().sum().detach().item()), None
+
+
+# ----------------------------------------------------------------------
+# Shared helpers
+# ----------------------------------------------------------------------
+def _eps(G):
+    return torch.finfo(G.dtype).eps
+
+
+def _cos_rows(G, ref):
+    eps = _eps(G)
+    return (G @ ref) / (G.norm(dim=1).clamp_min(eps) * ref.norm().clamp_min(eps))
+
+
+def _clip_updates(G, factor):
+    norms = G.norm(dim=1)
+    med = norms.median().clamp_min(_eps(G))
+    cap = max(float(factor), 1.0) * med
+    scale = (cap / norms.clamp_min(_eps(G))).clamp(max=1.0)
+    return G * scale.unsqueeze(1), norms, cap
 
 
 def _normalize(scores, floor=0.0):
@@ -48,23 +75,47 @@ def _normalize(scores, floor=0.0):
     return scores / scores.sum().clamp_min(1e-12)
 
 
-def _cos_rows(G, ref):
-    eps = torch.finfo(G.dtype).eps
-    return (G @ ref) / (G.norm(dim=1).clamp_min(eps) * ref.norm().clamp_min(eps))
+def _normalize_masked(scores, mask, floor=0.0):
+    eps = 1e-12
+    s = torch.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=0.0).clamp_min(0.0)
+    s = s * mask.to(s.dtype)
+    if float(s.sum()) <= eps:
+        s = mask.to(s.dtype)
+    if float(s.sum()) <= eps:
+        s = torch.ones_like(s)
+    s = s / s.sum().clamp_min(eps)
+    k = int(mask.sum().item())
+    if k > 0 and float(floor) > 0.0:
+        f = min(float(floor), 1.0 / k)
+        s = torch.where(mask, f + (1.0 - k * f) * s, torch.zeros_like(s))
+    return s / s.sum().clamp_min(eps)
 
 
-def _clip_updates(G, factor):
-    norms = G.norm(dim=1)
-    med = norms.median().clamp_min(torch.finfo(G.dtype).eps)
-    cap = max(float(factor), 1.0) * med
-    clipped = G * (cap / norms.clamp_min(torch.finfo(G.dtype).eps)).clamp(max=1.0).unsqueeze(1)
-    return clipped, norms, cap
+def _pairwise_agreement(Gh):
+    """Median off-diagonal cosine per row (robust while honest fraction > 50%)."""
+    n = Gh.shape[0]
+    C = Gh @ Gh.t()
+    if n < 2:
+        return torch.ones(n, device=Gh.device, dtype=Gh.dtype), C
+    off_mask = ~torch.eye(n, dtype=torch.bool, device=Gh.device)
+    off = C[off_mask].view(n, n - 1)
+    return off.median(dim=1).values, C
+
+
+def _cap_step(aggregate, clipped, config):
+    eps = _eps(clipped)
+    ref_norm = clipped.norm(dim=1).median().clamp_min(float(config.server_step_cap_min))
+    cap = max(float(config.server_step_cap_factor), 0.0) * ref_norm
+    norm = aggregate.norm()
+    if norm > cap and norm > eps:
+        aggregate = aggregate * (cap / norm)
+    return aggregate, cap
 
 
 def _temporal_scores(G, history, warmup, momentum, threshold, strength):
     n = G.shape[0]
+    eps = _eps(G)
     scores = torch.ones(n, device=G.device, dtype=G.dtype)
-    eps = torch.finfo(G.dtype).eps
     med_norm = G.norm(dim=1).median().clamp_min(eps)
     momentum = min(max(float(momentum), 0.0), 0.99)
     for i in range(n):
@@ -74,153 +125,228 @@ def _temporal_scores(G, history, warmup, momentum, threshold, strength):
             history[i] = {"ema": current.clone(), "rounds": 1}
             continue
         old = state["ema"].to(device=G.device, dtype=G.dtype)
-        innovation = (current - old).norm() / old.norm().clamp_min(0.1 * med_norm).clamp_min(eps)
+        denom = old.norm().clamp_min(0.1 * med_norm).clamp_min(eps)
+        innovation = (current - old).norm() / denom
         if int(state.get("rounds", 1)) >= int(warmup):
-            scores[i] = torch.exp(-float(strength) * torch.relu(innovation - float(threshold))).clamp(0.02, 1.0)
+            scores[i] = torch.exp(
+                -float(strength) * torch.relu(innovation - float(threshold))
+            ).clamp(0.02, 1.0)
         state["ema"] = (momentum * old + (1.0 - momentum) * current).detach()
         state["rounds"] = int(state.get("rounds", 1)) + 1
     return scores
 
 
-def _score_updates(G, config, history, method="FHHD-R"):
-    """Compute interpretable multi-signal weights and diagnostics."""
-    eps = torch.finfo(G.dtype).eps
-    clipped, raw_norms, cap = _clip_updates(G, config.norm_cap_factor)
+# ----------------------------------------------------------------------
+# Spatial Temporal baseline
+#   spatial  : median pairwise cosine agreement among client updates
+#   temporal : cosine consistency of each client with its own EMA direction
+# ----------------------------------------------------------------------
+def spatial_temporal(updates, config, client_history=None, f=0):
+    history = client_history if client_history is not None else {}
+    G = torch.stack(updates)
+    if G.shape[0] == 0:
+        raise ValueError("No client updates supplied.")
+    eps = _eps(G)
+    clipped, _, _ = _clip_updates(G, config.norm_cap_factor)
+    Gh = clipped / clipped.norm(dim=1, keepdim=True).clamp_min(eps)
+
+    agreement, _ = _pairwise_agreement(Gh)
+    spatial = torch.sigmoid(float(getattr(config, "st_spatial_temperature", 5.0)) * agreement)
+
+    n = G.shape[0]
+    temporal = torch.ones(n, device=G.device, dtype=G.dtype)
+    momentum = min(max(float(getattr(config, "st_temporal_momentum", 0.8)), 0.0), 0.99)
+    warmup = int(getattr(config, "st_temporal_warmup", 1))
+    t_temp = float(getattr(config, "st_temporal_temperature", 5.0))
+    for i in range(n):
+        cur = Gh[i].detach()
+        state = history.get(i)
+        if state is None:
+            history[i] = {"dir": cur.clone(), "rounds": 1}
+            continue
+        prev = state["dir"].to(device=G.device, dtype=G.dtype)
+        if int(state.get("rounds", 1)) >= warmup:
+            cos = torch.dot(cur, prev) / (cur.norm().clamp_min(eps) * prev.norm().clamp_min(eps))
+            temporal[i] = torch.sigmoid(t_temp * cos.clamp(-1.0, 1.0))
+        history[i] = {"dir": (momentum * prev + (1.0 - momentum) * cur).detach(),
+                      "rounds": int(state.get("rounds", 1)) + 1}
+
+    scores = (spatial * temporal).clamp_min(float(config.score_floor))
+    weights = _normalize(scores, getattr(config, "weight_floor", 0.0))
+    aggregate = (weights.unsqueeze(1) * clipped).sum(0)
+    aggregate, _ = _cap_step(aggregate, clipped, config)
+    energy = float((weights * clipped.square().sum(1)).sum().detach().item())
+    return aggregate, energy, weights.detach()
+
+
+# ----------------------------------------------------------------------
+# BOBA-inspired baseline
+#   Geometry heuristic: fit a rank-k subspace to the client updates and
+#   down-weight updates with large off-subspace residual. The Gram-matrix
+#   eigendecomposition is done on CPU in float64 for numerical stability.
+# ----------------------------------------------------------------------
+def boba_inspired(updates, config, f=0):
+    G = torch.stack(updates)
+    if G.shape[0] == 0:
+        raise ValueError("No client updates supplied.")
+    eps = _eps(G)
+    n = G.shape[0]
+    clipped, _, _ = _clip_updates(G, config.norm_cap_factor)
+
     center = clipped.median(dim=0).values
-    centered = clipped - center
-    distances = centered.norm(dim=1)
-    distance_scale = distances.median().clamp_min(0.1 * clipped.norm(dim=1).median()).clamp_min(eps)
-    center_score = torch.exp(-distances / (max(float(config.center_temperature), 0.1) * distance_scale))
+    X = clipped - center
+
+    rank_cfg = getattr(config, "boba_rank", None)
+    k = int(rank_cfg) if rank_cfg else max(1, n - 2 * int(f))
+    k = max(1, min(k, n - 1))
+
+    try:
+        K = (X @ X.t()).detach().double().cpu()
+        K = 0.5 * (K + K.t())
+        _, evecs = torch.linalg.eigh(K)
+        U = evecs[:, -k:].to(device=G.device, dtype=G.dtype)
+        proj = U @ (U.t() @ X)
+        residual = (X - proj).norm(dim=1)
+    except Exception:
+        residual = torch.zeros(n, device=G.device, dtype=G.dtype)
+
+    base = X.norm(dim=1).clamp_min(eps)
+    ratio = (residual / base).clamp(0.0, 2.0)
+    tau = max(float(getattr(config, "boba_residual_temperature", 0.5)), 1e-3)
+    subspace_score = torch.exp(-ratio / tau)
 
     cosine = _cos_rows(clipped, center).clamp(-1.0, 1.0)
-    direction_score = float(config.direction_floor) + (1.0 - float(config.direction_floor)) * torch.sigmoid(
-        float(config.direction_temperature) * cosine
-    )
+    direction_score = torch.sigmoid(
+        float(getattr(config, "boba_direction_temperature", 3.0)) * cosine)
 
-    peer_score = torch.ones(len(G), device=G.device, dtype=G.dtype)
-    if len(G) > 1:
-        for i in range(len(G)):
-            peers = torch.cat((clipped[:i], clipped[i+1:]), dim=0)
-            peer_center = peers.median(dim=0).values
-            peer_cos = _cos_rows(clipped[i:i+1], peer_center)[0].clamp(-1.0, 1.0)
-            peer_score[i] = torch.sigmoid(float(config.direction_temperature) * peer_cos)
+    scores = (subspace_score * direction_score).clamp_min(float(config.score_floor))
+    weights = _normalize(scores, getattr(config, "weight_floor", 0.0))
+    aggregate = (weights.unsqueeze(1) * clipped).sum(0)
+    aggregate, _ = _cap_step(aggregate, clipped, config)
+    energy = float((weights * clipped.square().sum(1)).sum().detach().item())
+    return aggregate, energy, weights.detach()
+
+
+# ----------------------------------------------------------------------
+# FHHD family
+# ----------------------------------------------------------------------
+def _signals(clipped, config, history):
+    eps = _eps(clipped)
+    Gh = clipped / clipped.norm(dim=1, keepdim=True).clamp_min(eps)
+
+    agreement, _ = _pairwise_agreement(Gh)
+    pos = agreement.clamp_min(0.0)
+    if float(pos.sum()) <= eps:
+        pos = torch.ones_like(agreement)
+    ref = ((pos / pos.sum()).unsqueeze(1) * clipped).sum(0)
+
+    center = clipped.median(dim=0).values
+    distances = (clipped - center).norm(dim=1)
+    scale = distances.median().clamp_min(
+        0.1 * clipped.norm(dim=1).median()).clamp_min(eps)
+    center_score = torch.exp(
+        -distances / (max(float(config.center_temperature), 0.1) * scale))
+
+    cosine = _cos_rows(clipped, ref).clamp(-1.0, 1.0)
+    direction_score = float(config.direction_floor) + (
+        1.0 - float(config.direction_floor)) * torch.sigmoid(
+            float(config.direction_temperature) * cosine)
+
+    thr = agreement.median()
+    agreement_score = torch.sigmoid(
+        float(getattr(config, "agreement_temperature", 8.0)) * (agreement - thr))
 
     temporal_score = _temporal_scores(
         clipped, history, config.temporal_warmup, config.temporal_momentum,
-        config.temporal_threshold, config.temporal_strength
-    )
+        config.temporal_threshold, config.temporal_strength)
 
-    # FHHD-R uses all four signals; FHHD-Plus preserves the older six-component
-    # implementation's intent but shares stable normalization and instrumentation.
+    gate = agreement >= -float(getattr(config, "agreement_gate", 0.05))
+    return dict(center_score=center_score, direction_score=direction_score,
+                agreement_score=agreement_score, temporal_score=temporal_score,
+                agreement=agreement, gate=gate, cosine=cosine, center=center)
+
+
+def _score_updates(G, config, history, method="FHHD-R", f=None):
+    eps = _eps(G)
+    n = G.shape[0]
+    clipped, _, _ = _clip_updates(G, config.norm_cap_factor)
+    sig = _signals(clipped, config, history)
+
+    stacked = torch.stack([sig["center_score"], sig["direction_score"],
+                           sig["agreement_score"], sig["temporal_score"]]).clamp_min(eps)
     if method == "FHHD-Plus":
-        scores = center_score * direction_score * peer_score * temporal_score
+        scores = stacked.prod(dim=0)
     else:
-        # Geometric averaging reduces the risk that multiplying several imperfect
-        # signals makes every score collapse to the floor.
-        signals = torch.stack([center_score, direction_score, peer_score, temporal_score]).clamp_min(eps)
-        scores = torch.exp(torch.log(signals).mean(dim=0))
+        scores = torch.exp(torch.log(stacked).mean(dim=0))
     scores = scores.clamp_min(float(config.score_floor))
-    weights = _normalize(scores, getattr(config, "weight_floor", 0.0))
+
+    gate = sig["gate"].clone()
+    max_reject = int(f) if f is not None else (n - 1) // 2
+    max_reject = max(0, min(max_reject, n - 1))
+    if int((~gate).sum().item()) > max_reject:
+        order = sig["agreement"].argsort()
+        gate = torch.ones(n, dtype=torch.bool, device=G.device)
+        gate[order[:max_reject]] = False
+
+    weights = _normalize_masked(scores, gate, getattr(config, "weight_floor", 0.0))
     aggregate = (weights.unsqueeze(1) * clipped).sum(0)
-
-    # Bound server-step magnitude relative to typical clipped client updates.
-    agg_norm = aggregate.norm()
-    ref_norm = clipped.norm(dim=1).median().clamp_min(float(config.server_step_cap_min))
-    step_cap = max(float(config.server_step_cap_factor), 0.0) * ref_norm
-    if agg_norm > step_cap and agg_norm > eps:
-        aggregate = aggregate * (step_cap / agg_norm)
-
-    diag = {
-        "raw_norms": raw_norms.detach(),
-        "clipped_norms": clipped.norm(dim=1).detach(),
-        "center_distances": distances.detach(),
-        "center_scores": center_score.detach(),
-        "direction_cosines": cosine.detach(),
-        "direction_scores": direction_score.detach(),
-        "peer_scores": peer_score.detach(),
-        "temporal_scores": temporal_score.detach(),
-        "weights": weights.detach(),
-        "clip_cap": float(cap.detach().item()),
-        "server_step_cap": float(step_cap.detach().item()),
-        "server_step_norm": float(aggregate.norm().detach().item()),
-        "center_aggregate_cosine": float(_cos_rows(aggregate.unsqueeze(0), center)[0].detach().item()) if aggregate.norm() > eps and center.norm() > eps else 0.0,
-    }
+    aggregate, _ = _cap_step(aggregate, clipped, config)
     energy = float((weights * clipped.square().sum(1)).sum().detach().item())
-    return aggregate, energy, weights.detach(), diag
+    return aggregate, energy, weights.detach()
 
 
-def fhhd_r(updates, config, client_history=None):
+def fhhd_r(updates, config, client_history=None, f=None):
     history = client_history if client_history is not None else {}
     G = torch.stack(updates)
     if G.shape[0] == 0:
         raise ValueError("No client updates supplied.")
-    aggregate, energy, weights, _ = _score_updates(G, config, history, method="FHHD-R")
-    return aggregate, energy, weights
+    return _score_updates(G, config, history, "FHHD-R", f)
 
 
-def fhhd_plus(updates, config, client_history=None, ablation=None):
-    """Backward-compatible FHHD-Plus approximation with optional ablations."""
+def fhhd_plus(updates, config, client_history=None, ablation=None, f=None):
     history = client_history if client_history is not None else {}
     G = torch.stack(updates)
     if G.shape[0] == 0:
         raise ValueError("No client updates supplied.")
-    # Retain the earlier ablation names for compatibility.
     ablation = ablation or "full"
     if ablation == "full":
-        aggregate, energy, weights, _ = _score_updates(G, config, history, method="FHHD-Plus")
-        return aggregate, energy, weights
-    # Ablations use the same raw diagnostics but explicitly disable one signal.
-    clipped, raw_norms, cap = _clip_updates(G, config.norm_cap_factor)
-    eps = torch.finfo(G.dtype).eps
-    center = clipped.median(0).values
-    distances = (clipped-center).norm(dim=1)
-    scale = distances.median().clamp_min(0.1*clipped.norm(dim=1).median()).clamp_min(eps)
-    center_score = torch.exp(-distances/(max(float(config.center_temperature),0.1)*scale))
-    cosine = _cos_rows(clipped, center).clamp(-1,1)
-    direction_score = float(config.direction_floor)+(1-float(config.direction_floor))*torch.sigmoid(float(config.direction_temperature)*cosine)
-    peer_score = torch.ones(len(G),device=G.device,dtype=G.dtype)
-    if len(G)>1:
-        for i in range(len(G)):
-            peers=torch.cat((clipped[:i],clipped[i+1:]),0)
-            peer_score[i]=torch.sigmoid(float(config.direction_temperature)*_cos_rows(clipped[i:i+1],peers.median(0).values)[0].clamp(-1,1))
-    temporal_score = _temporal_scores(clipped, history, config.temporal_warmup, config.temporal_momentum, config.temporal_threshold, config.temporal_strength)
-    signals = {"no_center": torch.ones_like(center_score), "no_direction": torch.ones_like(direction_score), "no_peer": torch.ones_like(peer_score), "no_temporal": torch.ones_like(temporal_score), "no_clip": None, "no_ipm_guard": None}
-    parts = []
-    parts.append(torch.ones_like(center_score) if ablation=="no_center" else center_score)
-    parts.append(torch.ones_like(direction_score) if ablation=="no_direction" else direction_score)
-    parts.append(torch.ones_like(peer_score) if ablation=="no_peer" else peer_score)
-    parts.append(torch.ones_like(temporal_score) if ablation=="no_temporal" else temporal_score)
-    if ablation == "no_clip":
-        clipped = G
-    score = torch.stack(parts).clamp_min(eps).prod(0).clamp_min(float(config.score_floor))
-    weights = _normalize(score, getattr(config,"weight_floor",0.0))
-    aggregate=(weights.unsqueeze(1)*clipped).sum(0)
-    cap_step=max(float(config.server_step_cap_factor),0.0)*clipped.norm(dim=1).median().clamp_min(float(config.server_step_cap_min))
-    if aggregate.norm()>cap_step and aggregate.norm()>eps:
-        aggregate=aggregate*(cap_step/aggregate.norm())
-    energy=float((weights*clipped.square().sum(1)).sum().detach().item())
-    return aggregate,energy,weights.detach()
+        return _score_updates(G, config, history, "FHHD-Plus", f)
 
+    eps = _eps(G)
+    base = G if ablation == "no_clip" else _clip_updates(G, config.norm_cap_factor)[0]
+    sig = _signals(base, config, history)
+    ones = torch.ones(G.shape[0], device=G.device, dtype=G.dtype)
+    parts = [
+        ones if ablation == "no_center" else sig["center_score"],
+        ones if ablation == "no_direction" else sig["direction_score"],
+        ones if ablation in ("no_peer", "no_agreement") else sig["agreement_score"],
+        ones if ablation == "no_temporal" else sig["temporal_score"],
+    ]
+    scores = torch.stack(parts).clamp_min(eps).prod(0).clamp_min(float(config.score_floor))
+    gate = (torch.ones(G.shape[0], dtype=torch.bool, device=G.device)
+            if ablation == "no_ipm_guard" else sig["gate"])
+    weights = _normalize_masked(scores, gate, getattr(config, "weight_floor", 0.0))
+    aggregate = (weights.unsqueeze(1) * base).sum(0)
+    aggregate, _ = _cap_step(aggregate, base, config)
+    energy = float((weights * base.square().sum(1)).sum().detach().item())
+    return aggregate, energy, weights.detach()
 
 
 def fhhd_r_plus(updates, config, client_history=None, f=0):
-    """Experimental FHHD-R + coordinate-trimmed hybrid; no performance guarantee."""
     history = client_history if client_history is not None else {}
     G = torch.stack(updates)
     if G.shape[0] == 0:
         raise ValueError("No client updates supplied.")
-    score_aggregate, energy, weights, _ = _score_updates(G, config, history, method="FHHD-R")
+    score_aggregate, energy, weights = _score_updates(G, config, history, "FHHD-R", f)
     clipped, _, _ = _clip_updates(G, config.norm_cap_factor)
+
     n = clipped.shape[0]
     trim = max(0, min(int(f), (n - 1) // 2))
     ordered = clipped.sort(dim=0).values
-    trimmed = ordered[trim:n-trim].mean(0) if trim > 0 and n > 2 * trim else clipped.mean(0)
+    trimmed = (ordered[trim:n - trim].mean(0)
+               if trim > 0 and n > 2 * trim else clipped.mean(0))
+
     blend = min(max(float(getattr(config, "fhhd_r_trimmed_blend", 0.25)), 0.0), 1.0)
     aggregate = (1.0 - blend) * score_aggregate + blend * trimmed
-    eps = torch.finfo(G.dtype).eps
-    ref_norm = clipped.norm(dim=1).median().clamp_min(float(config.server_step_cap_min))
-    cap = max(float(config.server_step_cap_factor), 0.0) * ref_norm
-    norm = aggregate.norm()
-    if norm > cap and norm > eps:
-        aggregate = aggregate * (cap / norm)
+    aggregate, _ = _cap_step(aggregate, clipped, config)
     return aggregate, energy, weights.detach()
