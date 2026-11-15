@@ -1,10 +1,3 @@
-"""Full matched-seed sweep: datasets x attacks x methods x seeds.
-
-Attacks (attacks.py) and model architectures (models.py) are unchanged.
-Byzantine IDs and partitions are randomized per seed block, then held fixed
-across methods and attacks for paired comparisons.
-"""
-
 import copy
 import csv
 import json
