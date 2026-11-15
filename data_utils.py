@@ -1,11 +1,3 @@
-"""Dataset loading and client partitioning (local-first, no forced downloads).
-
-RGB datasets are resized to config.image_size (default 32) so the existing
-SimpleCNN is reused unchanged. Folder datasets must be laid out as
-<root>/<domain>/<class>/*.{jpg,png,...}; a flat <root>/<class>/* layout is
-also accepted (treated as a single domain).
-"""
-
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -26,7 +18,6 @@ DOMAINNET_DOMAINS = ["clipart", "infograph", "painting", "quickdraw", "real", "s
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".ppm", ".tif", ".tiff"}
 
-# directory-name aliases so capitalisation variants resolve to one domain
 DOMAIN_ALIASES = {"caltech10": "caltech", "caltech": "caltech",
                   "artpainting": "art_painting", "art painting": "art_painting"}
 
@@ -37,10 +28,6 @@ MANUAL_INFO = {
                  "cifar-100-python.tar.gz", "cifar-100-python"),
 }
 
-
-# ----------------------------------------------------------------------
-# Containers / helpers
-# ----------------------------------------------------------------------
 class ImageListDataset(Dataset):
     def __init__(self, samples, classes, transform, domains=None, domain_names=None):
         self.samples = [(str(p), int(y)) for p, y in samples]
@@ -114,10 +101,6 @@ def _visible_dirs(path):
     return sorted([d for d in path.iterdir()
                    if d.is_dir() and not d.name.startswith(".")])
 
-
-# ----------------------------------------------------------------------
-# torchvision (local-first)
-# ----------------------------------------------------------------------
 def _manual_message(name, root):
     url, archive, folder = MANUAL_INFO.get(name, ("<url>", "<archive>", "<folder>"))
     return (f"{name} not present locally and download disabled/failed.\n"
@@ -137,10 +120,6 @@ def _load_tv(cls, name, root, train, transform, allow_download):
     except Exception as exc:
         raise FileNotFoundError(_manual_message(name, root) + f"\n{exc}") from exc
 
-
-# ----------------------------------------------------------------------
-# Folder scanning
-# ----------------------------------------------------------------------
 def _resolve_root(root, extra=()):
     root = Path(root)
     for cand in (root,) + tuple(Path(c) for c in extra):
@@ -155,8 +134,6 @@ def _scan_domain_class(root, allowed_domains, num_classes, max_per_class, seed):
         root = root / "images"
 
     candidates = _visible_dirs(root)
-    # keep only dirs that actually hold images (skips .git, README-only dirs,
-    # and the leftover HF `data/` parquet dir)
     domain_dirs = [d for d in candidates if _has_images(d) or
                    any(_has_images(c) for c in _visible_dirs(d))]
     if not domain_dirs:
@@ -167,11 +144,9 @@ def _scan_domain_class(root, allowed_domains, num_classes, max_per_class, seed):
     if allowed_domains:
         wanted = {_canon(d) for d in allowed_domains}
         filtered = [d for d in domain_dirs if _canon(d.name) in wanted]
-        if filtered:                      # fall back to all if filter misses
+        if filtered:                      
             domain_dirs = filtered
 
-    # classes = union of class dirs across domains; a domain whose subdirs hold
-    # images directly is treated as one implicit class (flat layout)
     class_names = sorted({c.name for d in domain_dirs for c in _visible_dirs(d)
                           if _has_images(c) or any(_has_images(g) for g in _visible_dirs(c))})
     if not class_names:
@@ -310,7 +285,6 @@ class _DefaultCfg:
 
 
 def get_dataset(name, config=None):
-    """Return (train_set, test_set, meta). meta is ALWAYS assigned."""
     cfg = config if config is not None else _DefaultCfg()
     root = Path(getattr(cfg, "data_root", "./data"))
     allow_dl = bool(getattr(cfg, "download", False))
@@ -378,10 +352,6 @@ def get_dataset(name, config=None):
                 train_size=len(train), test_size=len(test), dataset=key)
     return train, test, meta
 
-
-# ----------------------------------------------------------------------
-# Long-tail shaping
-# ----------------------------------------------------------------------
 def apply_longtail(dataset, imbalance, seed=0):
     targets = labels_from_dataset(dataset)
     classes = np.unique(targets)
@@ -396,10 +366,6 @@ def apply_longtail(dataset, imbalance, seed=0):
         keep.extend(idx[:min(n_c, len(idx))].tolist())
     return FilteredDataset(dataset, sorted(keep))
 
-
-# ----------------------------------------------------------------------
-# Partitioning
-# ----------------------------------------------------------------------
 def dirichlet_partition(dataset, num_clients, alpha):
     targets = labels_from_dataset(dataset)
     client_indices = [[] for _ in range(num_clients)]
