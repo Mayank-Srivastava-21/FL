@@ -1,6 +1,6 @@
 # Geometry- and History-Aware FHHD Aggregation for Federated Learning under Non-IID Data and Byzantine Perturbations
 
-**Team: FL Explorer** — Pragati Nayak, Mayank Srivastava, Gaurav Kumar Jha
+**Team: FL Explorer** — Pragati Nayak, Mayank Srivastava, Gaurav Kumar Jha\
 Indian Institute of Science Education and Research (IISER) Bhopal, India
 
 Code for the experimental study of three server-side aggregation rules in the **FHHD** family: **FHHD-Plus**, **FHHD-R**, and **FHHD-R+**. The rules are compared with FedAvg, Krum, coordinate-wise Trimmed Mean, a spatial-temporal baseline, and a BOBA-inspired baseline on four image benchmarks under four Byzantine attacks.
