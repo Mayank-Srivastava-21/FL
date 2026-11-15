@@ -1,19 +1,5 @@
-"""Aggregation rules.
-
-Baselines: FedAvg, Krum, TrimmedMean, Spatial Temporal, BOBA-inspired.
-Proposed : FHHD-Plus, FHHD-R, FHHD-R+.
-
-All rules return (aggregate, energy, client_weights); client_weights is None
-for coordinate-wise trimmed mean, where per-client scalars are undefined.
-These are research heuristics, not certified Byzantine-robust guarantees.
-"""
-
 import torch
 
-
-# ----------------------------------------------------------------------
-# Baselines
-# ----------------------------------------------------------------------
 def fedavg(updates):
     G = torch.stack(updates)
     n = len(updates)
@@ -45,10 +31,6 @@ def trimmed_mean(updates, f):
     aggregate = G.mean(0)
     return aggregate, float(aggregate.square().sum().detach().item()), None
 
-
-# ----------------------------------------------------------------------
-# Shared helpers
-# ----------------------------------------------------------------------
 def _eps(G):
     return torch.finfo(G.dtype).eps
 
@@ -92,7 +74,6 @@ def _normalize_masked(scores, mask, floor=0.0):
 
 
 def _pairwise_agreement(Gh):
-    """Median off-diagonal cosine per row (robust while honest fraction > 50%)."""
     n = Gh.shape[0]
     C = Gh @ Gh.t()
     if n < 2:
@@ -135,12 +116,6 @@ def _temporal_scores(G, history, warmup, momentum, threshold, strength):
         state["rounds"] = int(state.get("rounds", 1)) + 1
     return scores
 
-
-# ----------------------------------------------------------------------
-# Spatial Temporal baseline
-#   spatial  : median pairwise cosine agreement among client updates
-#   temporal : cosine consistency of each client with its own EMA direction
-# ----------------------------------------------------------------------
 def spatial_temporal(updates, config, client_history=None, f=0):
     history = client_history if client_history is not None else {}
     G = torch.stack(updates)
@@ -178,13 +153,6 @@ def spatial_temporal(updates, config, client_history=None, f=0):
     energy = float((weights * clipped.square().sum(1)).sum().detach().item())
     return aggregate, energy, weights.detach()
 
-
-# ----------------------------------------------------------------------
-# BOBA-inspired baseline
-#   Geometry heuristic: fit a rank-k subspace to the client updates and
-#   down-weight updates with large off-subspace residual. The Gram-matrix
-#   eigendecomposition is done on CPU in float64 for numerical stability.
-# ----------------------------------------------------------------------
 def boba_inspired(updates, config, f=0):
     G = torch.stack(updates)
     if G.shape[0] == 0:
@@ -230,6 +198,7 @@ def boba_inspired(updates, config, f=0):
 # ----------------------------------------------------------------------
 # FHHD family
 # ----------------------------------------------------------------------
+
 def _signals(clipped, config, history):
     eps = _eps(clipped)
     Gh = clipped / clipped.norm(dim=1, keepdim=True).clamp_min(eps)
