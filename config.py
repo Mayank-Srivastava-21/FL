@@ -83,8 +83,7 @@ class Config:
     boba_residual_temperature = 0.5
     boba_direction_temperature = 3.0
 
-    # ---------------- Output ----------------
     results_dir = "results_full_sweep"
     save_csv = True
     print_every = 5
-    max_runs = None               # integer for a smoke test
+    max_runs = None             
